@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 func main() {
 	logger := log.New(os.Stdout, "[myMemo] ", log.LstdFlags|log.Lshortfile)
 	cfg := config.Load()
+	// fmt.Println("Configuration loaded: ", cfg)
 
 	db, err := database.New(cfg.DatabaseURL)
 	if err != nil {
@@ -26,6 +28,7 @@ func main() {
 	}
 
 	openAIClient := myopenai.New(cfg.OpenAIAPIKey)
+	fmt.Println("Twilio WhatsApp Number:", cfg.TwilioWhatsAppNumber)
 	twilioClient := twilio.New(cfg.TwilioAccountSID, cfg.TwilioAuthToken, cfg.TwilioWhatsAppNumber)
 
 	reminderBot := bot.New(cfg, db, openAIClient, twilioClient, logger)

@@ -2,7 +2,9 @@ package twilio
 
 import (
 	"fmt"
+	"strings"
 
+	// "github.com/caarlos0/env/v11"
 	twilio "github.com/twilio/twilio-go"
 	openapi "github.com/twilio/twilio-go/rest/api/v2010"
 )
@@ -26,11 +28,43 @@ func (c *Client) SendWhatsAppMessage(to, body string) error {
 	if c.client == nil {
 		return fmt.Errorf("twilio client not initialised")
 	}
+
+	sender := normalizeWhatsAppAddress(c.fromWhatsApp)
+	if sender == "" {
+		return fmt.Errorf("twilio sender WhatsApp number is not configured")
+	}
+
+	recipient := normalizeWhatsAppAddress(to)
+	if recipient == "" {
+		return fmt.Errorf("recipient number missing or invalid")
+	}
+
+	fmt.Printf("Sending WhatsApp message to %s via %s: %s\n", recipient, sender, body)
+
 	params := &openapi.CreateMessageParams{}
-	params.SetTo(fmt.Sprintf("whatsapp:%s", to))
-	params.SetFrom(fmt.Sprintf("whatsapp:%s", c.fromWhatsApp))
+	params.SetTo(recipient)
+	params.SetFrom(sender)
 	params.SetBody(body)
 
-	_, err := c.client.Api.CreateMessage(params)
+	resp, err := c.client.Api.CreateMessage(params)
+	if err != nil {
+		return fmt.Errorf("twilio send message error: %w", err)
+	}
+
+	fmt.Printf("Twilio message sent, SID: %s\n", *resp.Sid)
 	return err
+}
+
+func normalizeWhatsAppAddress(number string) string {
+	trimmed := strings.TrimSpace(number)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "whatsapp:") {
+		return trimmed
+	}
+	if strings.HasPrefix(trimmed, "+") {
+		return "whatsapp:" + trimmed
+	}
+	return "whatsapp:+" + trimmed
 }

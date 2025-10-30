@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/pathakanu/myMemo/internal/config"
 	"github.com/pathakanu/myMemo/internal/model"
@@ -50,7 +51,7 @@ func New(cfg *config.Config, db *gorm.DB, openAI *myopenai.Client, twilioClient 
 
 // StartScheduler registers cron jobs and starts the scheduler loop.
 func (b *Bot) StartScheduler() error {
-	_, err := b.cron.AddFunc("0 8 * * *", func() {
+	_, err := b.cron.AddFunc("09 13 * * *", func() {
 		go b.sendScheduledReminders()
 	})
 	if err != nil {
@@ -105,23 +106,29 @@ func (b *Bot) handleIncomingMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		b.writeTwilioResponse(w, list)
 	case myopenai.IntentClearReminders:
-		if err := b.deleteReminder(userID, ""); err != nil {
-			b.logger.Printf("clear reminders: %v", err)
-			b.writeTwilioResponse(w, "Hmm, I couldn't clear your reminders. Please try again later.")
+		msg, err := b.deleteReminder(userID, "")
+		if err != nil {
+			if !isUserError(err) {
+				b.logger.Printf("clear reminders: %v", err)
+			}
+			b.writeTwilioResponse(w, err.Error())
 			return
 		}
-		b.writeTwilioResponse(w, "All reminders cleared.")
+		b.writeTwilioResponse(w, msg)
 	case myopenai.IntentDeleteReminder:
 		if keyword == "" {
 			b.writeTwilioResponse(w, "Tell me which reminder to delete, e.g. 'delete reminder about milk'.")
 			return
 		}
-		if err := b.deleteReminder(userID, keyword); err != nil {
-			b.logger.Printf("delete reminder: %v", err)
-			b.writeTwilioResponse(w, "I couldn't find that reminder.")
+		msg, err := b.deleteReminder(userID, keyword)
+		if err != nil {
+			if !isUserError(err) {
+				b.logger.Printf("delete reminder: %v", err)
+			}
+			b.writeTwilioResponse(w, err.Error())
 			return
 		}
-		b.writeTwilioResponse(w, fmt.Sprintf("Deleted reminders matching '%s'.", keyword))
+		b.writeTwilioResponse(w, msg)
 	case myopenai.IntentHelp:
 		b.writeTwilioResponse(w, helpResponse())
 	default:
@@ -226,13 +233,65 @@ func (b *Bot) listReminders(userID string) string {
 	return sb.String()
 }
 
-// deleteReminder deletes a reminder based on a keyword. When keyword is empty all reminders are removed.
-func (b *Bot) deleteReminder(userID, keyword string) error {
-	query := b.db.Where("user_id = ?", userID)
-	if strings.TrimSpace(keyword) != "" {
-		query = query.Where("LOWER(content) LIKE ?", "%"+strings.ToLower(keyword)+"%")
+// deleteReminder deletes reminders based on a keyword or index list and returns a status message.
+func (b *Bot) deleteReminder(userID, keyword string) (string, error) {
+	trimmed := strings.TrimSpace(keyword)
+	if trimmed == "" {
+		res := b.db.Where("user_id = ?", userID).Delete(&model.Reminder{})
+		if res.Error != nil {
+			return "", fmt.Errorf("I couldn't clear your reminders. Please try again later")
+		}
+		if res.RowsAffected == 0 {
+			return "", userError{"You don't have any reminders to clear."}
+		}
+		return "All reminders cleared.", nil
 	}
-	return query.Delete(&model.Reminder{}).Error
+
+	if indices := parseIndices(trimmed); len(indices) > 0 {
+		if _, err := b.deleteReminderByIndices(userID, indices); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Deleted reminder(s): %s.", formatIndices(indices)), nil
+	}
+
+	query := b.db.Where("user_id = ? AND LOWER(content) LIKE ?", userID, "%"+strings.ToLower(trimmed)+"%")
+	res := query.Delete(&model.Reminder{})
+	if res.Error != nil {
+		return "", fmt.Errorf("I couldn't delete that reminder. Please try again later")
+	}
+	if res.RowsAffected == 0 {
+		return "", userError{"I couldn't find any reminders matching that description."}
+	}
+	return fmt.Sprintf("Deleted reminders matching '%s'.", trimmed), nil
+}
+
+func (b *Bot) deleteReminderByIndices(userID string, indices []int) (int64, error) {
+	var reminders []model.Reminder
+	if err := b.db.Where("user_id = ?", userID).
+		Order("priority DESC, created_at ASC").
+		Find(&reminders).Error; err != nil {
+		return 0, fmt.Errorf("I couldn't look up your reminders right now. Please try again later")
+	}
+	if len(reminders) == 0 {
+		return 0, userError{"You don't have any reminders yet."}
+	}
+
+	ids := make([]uint, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 1 || idx > len(reminders) {
+			return 0, userError{fmt.Sprintf("Reminder %d doesn't exist. Choose between 1 and %d.", idx, len(reminders))}
+		}
+		ids = append(ids, reminders[idx-1].ID)
+	}
+
+	res := b.db.Where("user_id = ? AND id IN ?", userID, ids).Delete(&model.Reminder{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("I couldn't delete those reminders. Please try again later")
+	}
+	if res.RowsAffected == 0 {
+		return 0, userError{"I couldn't delete those reminders. Please try again later."}
+	}
+	return res.RowsAffected, nil
 }
 
 // sendScheduledReminders sends all reminders sorted by priority starting at 8AM local time.
@@ -336,6 +395,55 @@ func extractDeleteKeyword(message string) string {
 		return ""
 	}
 	return strings.TrimSpace(matches[1])
+}
+
+var indexListPattern = regexp.MustCompile(`^\s*\d+(?:[\s,]+\d+)*\s*$`)
+
+func parseIndices(input string) []int {
+	if !indexListPattern.MatchString(input) {
+		return nil
+	}
+	parts := strings.FieldsFunc(input, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+	seen := make(map[int]struct{}, len(parts))
+	indices := make([]int, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		num, err := strconv.Atoi(part)
+		if err != nil || num <= 0 {
+			return nil
+		}
+		if _, exists := seen[num]; exists {
+			continue
+		}
+		seen[num] = struct{}{}
+		indices = append(indices, num)
+	}
+	return indices
+}
+
+func formatIndices(indices []int) string {
+	out := make([]string, len(indices))
+	for i, idx := range indices {
+		out[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(out, ", ")
+}
+
+type userError struct {
+	msg string
+}
+
+func (e userError) Error() string {
+	return e.msg
+}
+
+func isUserError(err error) bool {
+	var ue userError
+	return errors.As(err, &ue)
 }
 
 type conversationStore struct {
