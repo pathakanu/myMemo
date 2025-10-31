@@ -51,7 +51,7 @@ func New(cfg *config.Config, db *gorm.DB, openAI *myopenai.Client, twilioClient 
 
 // StartScheduler registers cron jobs and starts the scheduler loop.
 func (b *Bot) StartScheduler() error {
-	_, err := b.cron.AddFunc("09 13 * * *", func() {
+	_, err := b.cron.AddFunc("56 12 * * *", func() {
 		go b.sendScheduledReminders()
 	})
 	if err != nil {
